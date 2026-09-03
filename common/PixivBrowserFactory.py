@@ -9,29 +9,29 @@ import socket
 import sys
 import time
 import traceback
+from typing import List, Literal, Tuple, Union
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request
-from typing import List, Literal, Tuple, Union
 
+import curl_cffi
 import demjson3
 import mechanize
 import socks
 from bs4 import BeautifulSoup
 from colorama import Fore, Style
-import curl_cffi
 
 import common.PixivHelper as PixivHelper
+from common.PixivException import PixivException
+from common.PixivOAuth import PixivOAuth
 from model.PixivArtist import PixivArtist
 from model.PixivBookmark import PixivNewIllustBookmark
-from common.PixivException import PixivException
 from model.PixivImage import PixivImage, PixivMangaSeries
 from model.PixivModelFanbox import FanboxArtist, FanboxPost
 from model.PixivModelSketch import SketchArtist, SketchPost
 from model.PixivNovel import MAX_LIMIT, NovelSeries, PixivNovel
-from common.PixivOAuth import PixivOAuth
 from model.PixivRanking import PixivNewIllust, PixivRanking
-from model.PixivTags import PixivTags
+from model.PixivTags import PixivTag, PixivTags
 
 defaultCookieJar = None
 defaultConfig = None
@@ -385,6 +385,8 @@ class PixivBrowser(mechanize.Browser):
             x_uid = headers.get('x-userid') or headers.get('X-UserId') or headers.get('X-Userid')
             if x_uid:
                 PixivHelper.print_and_log('info', f'Login recognized by server (x-userid={x_uid}).')
+                self._myId = int(x_uid)
+                PixivHelper.print_and_log('info', f'My User Id: {self._myId}.')
                 return True
 
             res = self.open_with_retry('https://www.pixiv.net')  # + self._locale)
@@ -982,6 +984,26 @@ class PixivBrowser(mechanize.Browser):
 
         return (result, response_page)
 
+    def getTagInfo(self, tag, lang=None) -> PixivTag:
+        if tag is None or len(tag) == 0:
+            raise PixivException("Tag is empty.", errorCode=PixivException.OTHER_ERROR)
+
+        encoded_tag = PixivHelper.encode_tags(tag)
+        url = f'https://www.pixiv.net/ajax/search/tags/{encoded_tag}'
+        if lang is None:
+            lang = self._locale
+        if lang:
+            url = f'{url}?lang={lang}'
+
+        response = self._get_from_cache(url)
+        if response is None:
+            res = self.open_with_retry(url)
+            response = res.read()
+            res.close()
+            self._put_to_cache(url, response)
+
+        return PixivTag(json.loads(response))
+
     def handleDebugTagSearchPage(self, response, url):
         if self._config.enableDump:
             if self._config.dumpTagSearchPage:
@@ -1071,6 +1093,50 @@ class PixivBrowser(mechanize.Browser):
         else:
             raise PixivException("Id does not exist", errorCode=PixivException.USER_ID_NOT_EXISTS)
 
+    def fanboxGetLatestSupportingPosts(self, pages) -> List[FanboxPost]:
+        self.fanbox_is_logged_in()
+        supported_creator_ids = {
+            str(creator_id)
+            for creator_id in self.fanboxGetArtistList(FanboxArtist.SUPPORTING)
+        }
+        artists = {}
+        posts = []
+        _tzInfo = None
+        if self._config.useLocalTimezone:
+            _tzInfo = PixivHelper.LocalUTCOffsetTimezone()
+
+        url = 'https://api.fanbox.cc/post.listSupporting?limit=10'
+        for current_page in range(1, pages + 1):
+            PixivHelper.print_and_log('info', f'Getting latest supporting posts page {current_page} from {url}')
+            req = mechanize.Request(url)
+            req.add_header('Accept', 'application/json, text/plain, */*')
+            req.add_header('Referer', 'https://www.fanbox.cc/')
+            req.add_header('Origin', 'https://www.fanbox.cc')
+            req.add_header('User-Agent', self._config.useragent)
+
+            res = self.open_with_retry(req)
+            response = res.read()
+            res.close()
+
+            js = demjson3.decode(response)
+            if "error" in js and js["error"]:
+                raise PixivException("Error when requesting latest supporting posts", 9999, response)
+            if "body" not in js or js["body"] is None:
+                break
+
+            for js_post in js["body"]["items"]:
+                creator_id = str(js_post["creatorId"])
+                if creator_id not in supported_creator_ids:
+                    continue
+                if creator_id not in artists:
+                    artists[creator_id] = self.fanboxGetArtistById(creator_id)
+                posts.append(FanboxPost(js_post["id"], artists[creator_id], js_post, _tzInfo))
+
+            url = js["body"].get("nextUrl")
+            if not url:
+                break
+        return posts
+
     def fanboxGetPostsFromArtist(self, artist: FanboxArtist = None, next_url="") -> List[FanboxPost]:
         ''' get all posts from the supported user
         from https://fanbox.pixiv.net/api/post.listCreator?userId=1305019&limit=10 '''
@@ -1122,16 +1188,19 @@ class PixivBrowser(mechanize.Browser):
 
     def fanboxUpdatePost(self, post: FanboxPost):
         js = self.fanboxGetPostJsonById(post.imageId, post.parent)
-        post.parsePost(js["body"])
-        post.parse_post_details(js["body"])
+        data = js["body"]
+        if "post" in data:  # new API response as of 2026-07-25
+            data = data["post"]
+        post.parsePost(data)
+        post.parse_post_details(data)
 
     def fanboxGetPostById(self, post_id):
         js = self.fanboxGetPostJsonById(post_id)
         _tzInfo = None
         if self._config.useLocalTimezone:
             _tzInfo = PixivHelper.LocalUTCOffsetTimezone()
-        artist = self.fanboxGetArtistById(js["body"]["creatorId"])
-        post = FanboxPost(post_id, artist, js["body"], _tzInfo)
+        artist = self.fanboxGetArtistById(js["body"]["post"]["creatorId"])
+        post = FanboxPost(post_id, artist, js["body"]["post"], _tzInfo)
         return post
 
     def fanboxGetPostJsonById(self, post_id, artist=None):
@@ -1147,10 +1216,14 @@ class PixivBrowser(mechanize.Browser):
         p_req.add_header('Referer', p_referer)
         p_req.add_header('Origin', 'https://www.fanbox.cc')
         p_req.add_header('User-Agent', self._config.useragent)
-        p_req.add_header('Cookie', self._config.cookieFanboxTemp)
+        p_req.add_header('Cookie', "; ".join(
+            f"{c.name}={c.value}" for c in self._ua_handlers['_cookies'].cookiejar
+            if c.domain in (".fanbox.cc", "fanbox.cc", "api.fanbox.cc")
+        ))
+        impersonation = self._config.userAgentImpersonation or "firefox135" # default value
 
         try:
-            p_res = curl_cffi.get(p_url, impersonate="firefox135", headers=p_req.headers)
+            p_res = curl_cffi.get(p_url, impersonate=impersonation, headers=p_req.headers)
         except HTTPError as ex:
             if ex.code in [404]:
                 raise PixivException("Fanbox post not found!", PixivException.OTHER_ERROR)

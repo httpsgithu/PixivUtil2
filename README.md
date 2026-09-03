@@ -28,6 +28,7 @@
 - Download by artist/creator id (FANBOX)
 - Download by post id (FANBOX)
 - Download from followed artists (FANBOX)
+- Download latest posts from supported artists (FANBOX)
 - Re-encoding of all ugoira present in folder
 - Batch Download from batch_job.json (experimental)
   See https://github.com/Nandaka/PixivUtil2/wiki/Using-Batch-Job-(Experimental)
@@ -152,7 +153,22 @@ Q10. I got this error またはメールアドレス、パスワードが正し�
 Q11. Older windows support (e.g. Win7)?
     - You can try to run from source code with the latest supported python 3.x.
       See the instruction here: https://github.com/Nandaka/PixivUtil2/wiki/IDE-Enviroment-(Windows)
-
+      
+Q12. How do I get around Cloudflare preventing me from downloading from Fanbox
+    - Go to https://www.whatismybrowser.com/detect/what-is-my-user-agent/ and copy your user agent to the `useragent` field in config.ini
+    - Go to https://curl-cffi.readthedocs.io/en/latest/impersonate/targets.html to see a list of supported browsers for impersonation. Inside config.ini, replace userAgentImpersonation with the appropriate browser you would like to impersonate. If you do not know which browser to use, just use the latest one that closely matches your user agent.
+    - Change your user agent's version in config.ini to match the browser you are impersonating. For example, `Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0` => `Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/147.0` if you are impersonating `firefox147`
+    - Have your browser's network tab open and visit fanbox.
+    - Filter your network requests by "post" and click on any network request
+    - Go to the "headers" tab on the ribbon and scroll down to the "request headers" section.
+    - Enable "raw" text to get the real string values
+    - Copy the value from "Cookie" into `cookieFanboxTemp` in config.ini. Your cookie should be a long string that looks like `p_ab_id=<omitted>; p_ab_id_2=<omitted>; p_ab_d_id=<omitted>; cf_clearance=<omitted>; privacy_policy_agreement=<omitted>; privacy_policy_notification=<omitted>; __cf_bm=<omitted>; FANBOXSESSID=<omitted> ...`
+    - You may have more or fewer fields for your cookie. This is normal.
+    - If these steps stopped working, you probably:
+      - Logged out on fanbox
+      - Changed your IP
+      - Are using an IP address that is specifically blacklisted by Fanbox
+      - Are on the Japanese site for fanbox
 ```
 ## B.Bugs/Source Code/Supports
 ```
@@ -278,6 +294,8 @@ Please refer run with `--help` for latest information.
                             (optional: End Page)
                         f5 - Download from custom artist list (FANBOX)
                             (optional: End page, path to list)
+                        f7 - Download latest posts from supported artists (FANBOX)
+                            (optional: number of pages greater than 0, default: 1)
                         b - Batch Download from batch_job.json (experimental)
                             (optional: --bf=BATCH_FILE)
                         l - Export local database image_id/post_id
@@ -329,9 +347,15 @@ Please refer run with `--help` for latest information.
 - cookieFanbox
 
   Cookie for fanbox.cc, normally no need to fill in.
+- cookieFanboxTemp
+
+  Workaround for Fanbox's TLS fingerprinting blacklist. See Q.12 of Usage for instructions.
 - refresh_token
 
   Used for OAuth refresh token to avoid relogin too many time. Automatically generated upon succesful OAuth login.
+- userAgentImpersonation
+
+  Parametrised argument to customise which browser PixivUtil2 will impersonate when downloading from Fanbox. Defaults to `firefox135`.
 
 ## [Pixiv]
 - numberofpage
@@ -365,6 +389,10 @@ Please refer run with `--help` for latest information.
 - autoAddCaption
 
   Automatically save captions for db for all downloads.
+
+- autoAddStats
+
+  Automatically save an artwork's engagement stats (view, like, bookmark, comment and response counts).
 
 - aiDisplayFewer
 
@@ -403,9 +431,15 @@ Please refer run with `--help` for latest information.
 
   Set to `True` to download FANBOX post cover images even if they are restricted.
 - checkDBProcessHistory
+
   Each FANBOX post has a updated_date value, which will be recorded/updated in database after it is processed.
   - When this is `True`, the values in database would be checked when processing each post. If record is no earlier than the newly retrieved date, which means that the post has not been processed at all or changed since last time, the post would be skipped.
+  - Can be combined with `checkUpdatedLimitFanbox` to stop checking more posts for the current FANBOX member after enough unchanged/already-processed posts are encountered.
   - When this is `False`, posts will be processed anyways.
+- checkUpdatedLimitFanbox
+
+  Skip to next FANBOX member if a number of consecutive previously processed/unchanged posts are encountered for the current member while `checkDBProcessHistory` is enabled.
+  Set to `0` to disable.
 - listPathFanbox
 
   The list file for fanbox creators. One creator per line.
@@ -457,6 +491,11 @@ Please refer run with `--help` for latest information.
 - logLevel
 
   Set log level, valid values are CRITICAL, ERROR, WARNING, INFO, DEBUG, and NOTSET
+
+  Two log files are written next to the application: `pixivutil.log` with everything
+  at the configured level, and `pixivutil_error.log` with only warnings and errors,
+  so a failed run can be reviewed without searching the full log. Both rotate at
+  10MB, keeping 10 backups, and both are suppressed by `disableLog`.
 - enableDump
 
   Enable HTML Dump. Set to False to disable.
@@ -675,7 +714,7 @@ Please refer run with `--help` for latest information.
   The file extension (container format) to use for encoding. default: `webm`.
 - ffmpegparam
 
-  Parameter to be used to encode webm, default: `-lossless 0 -crf 15 -b 0 -vsync 0`.
+  Parameter to be used to encode webm, default: `-lossless 0 -crf 15 -b 0 -fps_mode passthrough`.
 - mkvcodec
 
   Codec to be used for encoding mkv, default is using `copy`.
@@ -687,13 +726,13 @@ Please refer run with `--help` for latest information.
   Codec to be used for encoding avif, default is using `libaom-av1`.
 - avifparam
 
-  Parameter to be used to encode avif, default: `-cpu-used 4 -crf 0 -row-mt 1 -tile-columns 2 -tile-rows 2 -vsync 0`.
+  Parameter to be used to encode avif, default: `-cpu-used 4 -crf 0 -row-mt 1 -tile-columns 2 -tile-rows 2 -fps_mode passthrough`.
 - webpcodec
 
   Codec to be used for encoding webm, default is using `libwebp`.
 - webpparam
 
-  Parameter to be used to encode webm, default: `-lossless 0 -compression_level 5 -quality 100 -loop 0 -vsync 0`.
+  Parameter to be used to encode webm, default: `-lossless 0 -compression_level 5 -quality 100 -loop 0 -fps_mode passthrough`.
 
 ## [Ugoira]
 - writeugoirainfo
